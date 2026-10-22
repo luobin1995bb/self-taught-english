@@ -1,0 +1,37 @@
+# Gradle
+.gradle/
+build/
+/captures
+.externalNativeBuild/
+.cxx/
+
+# 本地环境配置（含 SDK 路径，不可提交）
+local.properties
+
+# Kotlin 编译器缓存
+.kotlin/
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+*.hprof
+
+# 构建产物
+*.apk
+*.aab
+*.aar
+*.ap_
+*.dex
+
+# 签名文件与密钥（切勿提交）
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
