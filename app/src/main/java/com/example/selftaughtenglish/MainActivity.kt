@@ -26,12 +26,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -40,17 +42,27 @@ import com.example.selftaughtenglish.audio.PracticeAudioRecorder
 import com.example.selftaughtenglish.learning.DailyLessonProvider
 import com.example.selftaughtenglish.learning.PracticeSection
 import com.example.selftaughtenglish.learning.PracticeSession
+import com.example.selftaughtenglish.learning.PracticeType
+import com.example.selftaughtenglish.learning.ProgressStore
 import com.example.selftaughtenglish.learning.PronunciationPrompt
 import com.example.selftaughtenglish.learning.RecordingControlsState
+import com.example.selftaughtenglish.learning.SpeechFeedback
+import com.example.selftaughtenglish.learning.analyzeSpeech
+import com.example.selftaughtenglish.learning.countWords
+import com.example.selftaughtenglish.ui.WaveformBars
 import com.example.selftaughtenglish.ui.theme.SelfTaughtEnglishTheme
 import java.util.Locale
+import kotlinx.coroutines.delay
 
 private const val IDLE_RECORDING_HINT = "录音后回放，对比自己和示范音的差别。"
+private const val MAX_AMPLITUDE_SAMPLES = 240
+private const val AMPLITUDE_POLL_MILLIS = 120L
 
 class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var textToSpeech: TextToSpeech? = null
     private lateinit var audioRecorder: PracticeAudioRecorder
     private val lessonProvider = DailyLessonProvider()
+    private val progressStore by lazy { ProgressStore(this) }
     private var ttsReady = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -63,11 +75,14 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     DailyLessonScreen(
                         lessonProvider = lessonProvider,
+                        progressStore = progressStore,
                         onSpeak = ::speak,
                         hasRecordAudioPermission = ::hasRecordAudioPermission,
                         onStartRecording = audioRecorder::startRecording,
                         onStopRecording = audioRecorder::stopRecording,
                         onPlayRecording = audioRecorder::playRecording,
+                        onSampleAmplitude = audioRecorder::currentAmplitude,
+                        onLastRecordingDuration = audioRecorder::lastRecordingDurationMs,
                         modifier = Modifier.padding(innerPadding),
                     )
                 }
@@ -107,25 +122,51 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 @Composable
 fun DailyLessonScreen(
     lessonProvider: DailyLessonProvider,
+    progressStore: ProgressStore,
     onSpeak: (String) -> Unit,
     hasRecordAudioPermission: () -> Boolean,
     onStartRecording: () -> Unit,
     onStopRecording: () -> Boolean,
     onPlayRecording: () -> Unit,
+    onSampleAmplitude: () -> Int,
+    onLastRecordingDuration: () -> Long,
     modifier: Modifier = Modifier,
 ) {
     var selectedDay by remember { mutableStateOf(1) }
     var session by remember { mutableStateOf<PracticeSession?>(null) }
     var finishedDay by remember { mutableStateOf<Int?>(null) }
+    var completedDays by remember { mutableStateOf(progressStore.completedDays()) }
+    var streak by remember { mutableStateOf(progressStore.streak()) }
+    var reviewFlags by remember { mutableStateOf(progressStore.reviewFlags()) }
     var recordingState by remember { mutableStateOf(RecordingControlsState()) }
     var recordingHint by remember { mutableStateOf(IDLE_RECORDING_HINT) }
+    var amplitudes by remember { mutableStateOf<List<Int>>(emptyList()) }
+    var feedback by remember { mutableStateOf<SpeechFeedback?>(null) }
     var pendingStartAfterPermission by remember { mutableStateOf(false) }
 
     val lesson = remember(selectedDay) { lessonProvider.lessonForDay(selectedDay) }
+    val currentLessonDay = selectedDay
+    val isCurrentDayCompleted = completedDays.contains(currentLessonDay)
+    val isReviewMarked = reviewFlags.contains(ProgressStore.reviewKey(currentLessonDay))
+
+    // 录音期间按固定间隔采样振幅，用于绘制波形；录音结束后自动停止。
+    LaunchedEffect(recordingState.isRecording) {
+        if (recordingState.isRecording) {
+            amplitudes = emptyList()
+            feedback = null
+            while (true) {
+                val sample = onSampleAmplitude()
+                amplitudes = (amplitudes + sample).takeLast(MAX_AMPLITUDE_SAMPLES)
+                delay(AMPLITUDE_POLL_MILLIS)
+            }
+        }
+    }
 
     val resetRecording: () -> Unit = {
         recordingState = RecordingControlsState()
         recordingHint = IDLE_RECORDING_HINT
+        amplitudes = emptyList()
+        feedback = null
     }
 
     val changeDay: (Int) -> Unit = { target ->
@@ -164,6 +205,12 @@ fun DailyLessonScreen(
             fontWeight = FontWeight.Bold,
         )
 
+        Text(
+            text = "已完成 ${completedDays.size} 天 · 连续 $streak 天",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -198,6 +245,13 @@ fun DailyLessonScreen(
             style = MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (isCurrentDayCompleted) {
+            Text(
+                text = "这一天已完成，可以再练一遍",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
 
         lesson.sections.forEachIndexed { index, section ->
             PracticeSectionCard(
@@ -213,15 +267,24 @@ fun DailyLessonScreen(
                 session = activeSession,
                 recordingState = recordingState,
                 recordingHint = recordingHint,
+                amplitudes = amplitudes,
+                feedback = feedback,
+                isReviewMarked = isReviewMarked,
                 onSpeak = onSpeak,
                 onRecordClick = {
                     if (recordingState.isRecording) {
                         val saved = onStopRecording()
                         recordingState = RecordingControlsState(hasRecording = saved)
-                        recordingHint = if (saved) {
-                            "录好了。现在可以播放自己的录音。"
+                        if (saved) {
+                            val prompt = PronunciationPrompt.from(activeSession.currentSection)
+                            feedback = analyzeSpeech(
+                                durationMs = onLastRecordingDuration(),
+                                amplitudes = amplitudes,
+                                wordCount = countWords(prompt.textToSpeak),
+                            )
+                            recordingHint = "录好了。下面是这次录音的客观数据。"
                         } else {
-                            "这次录音太短，没有保存成功。再试一次。"
+                            recordingHint = "这次录音太短，没有保存成功。再试一次。"
                         }
                     } else if (hasRecordAudioPermission()) {
                         onStartRecording()
@@ -244,7 +307,13 @@ fun DailyLessonScreen(
                 onFinish = {
                     session = null
                     finishedDay = selectedDay
+                    streak = progressStore.markDayCompleted(selectedDay)
+                    completedDays = progressStore.completedDays()
                     resetRecording()
+                },
+                onToggleReview = {
+                    progressStore.toggleReview(currentLessonDay)
+                    reviewFlags = progressStore.reviewFlags()
                 },
             )
         } else if (finishedDay == selectedDay) {
@@ -265,8 +334,13 @@ fun DailyLessonScreen(
                         fontWeight = FontWeight.SemiBold,
                     )
                     Text(
-                        text = "四个环节都走完了。可以换下一天，也可以再练一遍。",
+                        text = "四个环节都走完了。进度已保存，关掉 App 也不会丢。",
                         style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Text(
+                        text = "累计完成 ${completedDays.size} 天 · 连续 $streak 天",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Button(
@@ -302,14 +376,19 @@ private fun PracticePanel(
     session: PracticeSession,
     recordingState: RecordingControlsState,
     recordingHint: String,
+    amplitudes: List<Int>,
+    feedback: SpeechFeedback?,
+    isReviewMarked: Boolean,
     onSpeak: (String) -> Unit,
     onRecordClick: () -> Unit,
     onPlayRecording: () -> Unit,
     onPrevious: () -> Unit,
     onNext: () -> Unit,
     onFinish: () -> Unit,
+    onToggleReview: () -> Unit,
 ) {
     val prompt = PronunciationPrompt.from(session.currentSection)
+    val section = session.currentSection
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -333,7 +412,7 @@ private fun PracticePanel(
                 color = MaterialTheme.colorScheme.onPrimaryContainer,
             )
             Text(
-                text = session.currentSection.description,
+                text = section.description,
                 style = MaterialTheme.typography.bodyMedium,
             )
             Text(
@@ -366,6 +445,34 @@ private fun PracticePanel(
                     Text(recordingState.playbackButtonText)
                 }
             }
+
+            if (recordingState.isRecording || amplitudes.isNotEmpty()) {
+                WaveformBars(amplitudes = amplitudes)
+            }
+
+            feedback?.let { result ->
+                Text(
+                    text = "${result.durationText} · ${result.paceText}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = result.volumeText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
+            }
+
+            if (section.type == PracticeType.Review) {
+                Button(
+                    onClick = onToggleReview,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(8.dp),
+                ) {
+                    Text(if (isReviewMarked) "已标记需要复习" else "标记今天需要复习")
+                }
+            }
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -432,14 +539,19 @@ private fun PracticeSectionCard(
 @Preview(showBackground = true)
 @Composable
 fun DailyLessonPreview() {
+    val context = LocalContext.current
+    val previewStore = remember(context) { ProgressStore(context) }
     SelfTaughtEnglishTheme {
         DailyLessonScreen(
             lessonProvider = DailyLessonProvider(),
+            progressStore = previewStore,
             onSpeak = {},
             hasRecordAudioPermission = { true },
             onStartRecording = {},
             onStopRecording = { true },
             onPlayRecording = {},
+            onSampleAmplitude = { 0 },
+            onLastRecordingDuration = { 0L },
         )
     }
 }

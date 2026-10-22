@@ -9,11 +9,15 @@ import java.io.File
 class PracticeAudioRecorder(private val context: Context) {
     private var recorder: MediaRecorder? = null
     private var player: MediaPlayer? = null
+    private var recordingStartedAt: Long = 0L
+    private var lastDurationMs: Long = 0L
     private val outputFile: File = File(context.cacheDir, "latest-pronunciation-practice.m4a")
 
     fun startRecording() {
         stopPlayback()
         outputFile.delete()
+        recordingStartedAt = System.currentTimeMillis()
+        lastDurationMs = 0L
 
         recorder = newRecorder().apply {
             setAudioSource(MediaRecorder.AudioSource.MIC)
@@ -29,6 +33,8 @@ class PracticeAudioRecorder(private val context: Context) {
 
     fun stopRecording(): Boolean {
         val activeRecorder = recorder ?: return outputFile.exists()
+        lastDurationMs = currentRecordingMillis()
+        recordingStartedAt = 0L
         return runCatching {
             activeRecorder.stop()
             activeRecorder.release()
@@ -57,7 +63,21 @@ class PracticeAudioRecorder(private val context: Context) {
     fun release() {
         runCatching { recorder?.release() }
         recorder = null
+        recordingStartedAt = 0L
         stopPlayback()
+    }
+
+    /** 录音过程中轮询当前振幅（0..32767），未在录音时返回 0。 */
+    fun currentAmplitude(): Int {
+        return runCatching { recorder?.maxAmplitude ?: 0 }.getOrDefault(0)
+    }
+
+    /** 上一次录音的时长，毫秒。 */
+    fun lastRecordingDurationMs(): Long = lastDurationMs
+
+    private fun currentRecordingMillis(): Long {
+        if (recordingStartedAt == 0L) return 0L
+        return System.currentTimeMillis() - recordingStartedAt
     }
 
     private fun stopPlayback() {
